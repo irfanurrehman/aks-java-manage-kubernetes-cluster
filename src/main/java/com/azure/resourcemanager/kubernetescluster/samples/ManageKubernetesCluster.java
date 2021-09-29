@@ -9,130 +9,114 @@ import com.azure.identity.DefaultAzureCredentialBuilder;
 import com.azure.resourcemanager.AzureResourceManager;
 import com.azure.resourcemanager.containerservice.models.ContainerServiceVMSizeTypes;
 import com.azure.resourcemanager.containerservice.models.KubernetesCluster;
+import com.azure.resourcemanager.containerservice.models.KubernetesClusterAgentPool;
 import com.azure.core.management.Region;
 import com.azure.core.management.profile.AzureProfile;
 import com.azure.resourcemanager.samples.SSHShell;
 import com.azure.resourcemanager.samples.Utils;
 import com.jcraft.jsch.JSchException;
 
+import io.fabric8.kubernetes.client.Config;
+import io.fabric8.kubernetes.client.DefaultKubernetesClient;
+import io.fabric8.kubernetes.client.KubernetesClient;
+import io.fabric8.kubernetes.api.model.NodeList;
+import io.fabric8.kubernetes.api.model.Node;
+
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.util.Date;
 
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.time.Duration;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+
 /**
  * Azure Container Service (AKS) sample for managing a Kubernetes cluster.
- *   - Create an Azure Container Service (AKS) with managed Kubernetes cluster
- *   - Create a SSH private/public key
- *   - Update the number of agent virtual machines in the Kubernetes cluster
  */
 public class ManageKubernetesCluster {
 
-    /**
-     * Main function which runs the actual sample.
-     *
-     * @param azureResourceManager instance of the azure client
-     * @param clientId secondary service principal client ID
-     * @param secret secondary service principal secret
-     * @return true if sample runs successfully
-     */
-    public static boolean runSample(AzureResourceManager azureResourceManager, String clientId, String secret) throws IOException, JSchException {
-        final String rgName = Utils.randomResourceName(azureResourceManager, "rgaks", 15);
-        final String aksName = Utils.randomResourceName(azureResourceManager, "akssample", 30);
-        final Region region = Region.US_EAST;
-        String servicePrincipalClientId = clientId; // replace with a real service principal client id
-        String servicePrincipalSecret = secret; // and corresponding secret
-        final String rootUserName = "aksuser";
+    public static boolean scaleNodeUp(AzureResourceManager azureResourceManager, String clientId, String secret, String nodeName) throws IOException, JSchException {
 
         try {
 
-            //=============================================================
-            // If service principal client id and secret are not set via the local variables, attempt to read the service
-            //     principal client id and secret from a secondary ".azureauth" file set through an environment variable.
-            //
-            //     If the environment variable was not set then reuse the main service principal set for running this sample.
+            // List eks clusters
+            //final list<KubernetesCluster> clusters = azureResourceManager.kubernetesClusters().list();
+            for (KubernetesCluster cluster: azureResourceManager.kubernetesClusters().list()) {
+                System.out.println("Found EKS cluster: " + cluster.name());
+            }
 
-            if (servicePrincipalClientId == null || servicePrincipalClientId.isEmpty() || servicePrincipalSecret == null || servicePrincipalSecret.isEmpty()) {
-                servicePrincipalClientId = System.getenv("AZURE_CLIENT_ID");
-                servicePrincipalSecret = System.getenv("AZURE_CLIENT_SECRET");
-                if (servicePrincipalClientId == null || servicePrincipalClientId.isEmpty() || servicePrincipalSecret == null || servicePrincipalSecret.isEmpty()) {
-                    String envSecondaryServicePrincipal = System.getenv("AZURE_AUTH_LOCATION_2");
 
-                    if (envSecondaryServicePrincipal == null || !envSecondaryServicePrincipal.isEmpty() || !Files.exists(Paths.get(envSecondaryServicePrincipal))) {
-                        envSecondaryServicePrincipal = System.getenv("AZURE_AUTH_LOCATION");
+            // Get the agentpool label from the kubernetes node matching the node name we have
+            // List the clusters agentpools and match both
+            // As of now this looks like the only way to get the agentpool of the corresponding node from name.
+            for (KubernetesCluster cluster: azureResourceManager.kubernetesClusters().list()) {
+
+                //=============================================================
+                // Instantiate the Kubernetes client using the ".kube/config" file content from the Kubernetes cluster
+                //     The Kubernetes client API requires setting an environment variable pointing at a real file;
+                //        we will create a temporary file that will be deleted automatically when the sample exits
+
+                System.out.println("Found Kubernetes master at: " + cluster.fqdn());
+
+                byte[] kubeConfigContent = cluster.adminKubeConfigContent();
+                File tempKubeConfigFile = File.createTempFile("kube", ".config", new File(System.getProperty("java.io.tmpdir")));
+                tempKubeConfigFile.deleteOnExit();
+                try (BufferedWriter buffOut = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(tempKubeConfigFile), StandardCharsets.UTF_8))) {
+                    buffOut.write(new String(kubeConfigContent, StandardCharsets.UTF_8));
+                }
+
+                System.setProperty(Config.KUBERNETES_KUBECONFIG_FILE, tempKubeConfigFile.getPath());
+                Config config = new Config();
+                KubernetesClient kubernetesClient = new DefaultKubernetesClient(config);
+
+                // Print the node list
+                System.out.println(kubernetesClient.nodes().list());
+
+                for (Node node: kubernetesClient.nodes().list().getItems()){
+
+                    if (node.getMetadata().getName().matches(nodeName)){
+
+                        String nodesAgentPool = node.getMetadata().getLabels().get("agentpool");
+                        KubernetesClusterAgentPool pool = cluster.agentPools().get(nodesAgentPool);
+
+                        // scale the agent pool up
+                        int count = pool.count();
+
+                        cluster.update()
+                        .updateAgentPool(pool.name())
+                        .withAgentPoolVirtualMachineCount(count++)
+                        .parent()
+                        .apply();
+
                     }
 
-                    servicePrincipalClientId = Utils.getSecondaryServicePrincipalClientID(envSecondaryServicePrincipal);
-                    servicePrincipalSecret = Utils.getSecondaryServicePrincipalSecret(envSecondaryServicePrincipal);
                 }
+
             }
 
-
-            //=============================================================
-            // Create an SSH private/public key pair to be used when creating the container service
-
-            System.out.println("Creating an SSH private and public key pair");
-
-            SSHShell.SshPublicPrivateKey sshKeys = SSHShell.generateSSHKeys("", "ACS");
-            System.out.println("SSH private key value: " + sshKeys.getSshPrivateKey());
-            System.out.println("SSH public key value: " + sshKeys.getSshPublicKey());
-
-
-            //=============================================================
-            // Create a Kubernetes cluster with one agent pool of size one
-
-            System.out.println("Creating a Kubernetes cluster");
-
-            Date t1 = new Date();
-
-            KubernetesCluster kubernetesCluster = azureResourceManager.kubernetesClusters().define(aksName)
-                .withRegion(region)
-                .withNewResourceGroup(rgName)
-                .withDefaultVersion()
-                .withRootUsername(rootUserName)
-                .withSshKey(sshKeys.getSshPublicKey())
-                .withServicePrincipalClientId(servicePrincipalClientId)
-                .withServicePrincipalSecret(servicePrincipalSecret)
-                .defineAgentPool("agentpool")
-                    .withVirtualMachineSize(ContainerServiceVMSizeTypes.STANDARD_D1_V2)
-                    .withAgentPoolVirtualMachineCount(1)
-                    .attach()
-                .withDnsPrefix("dns-" + aksName)
-                .create();
-
-            Date t2 = new Date();
-            System.out.println("Created Azure Container Service (AKS) resource: (took " + ((t2.getTime() - t1.getTime()) / 1000) + " seconds) " + kubernetesCluster.id());
-            Utils.print(kubernetesCluster);
-
-            //=============================================================
-            // Update a Kubernetes cluster agent pool to two machines
-
-            System.out.println("Updating a Kubernetes cluster agent pool to two virtual machines");
-
-            t1 = new Date();
-
-            kubernetesCluster.update()
-                .updateAgentPool("agentpool")
-                    .withAgentPoolVirtualMachineCount(2)
-                    .parent()
-                .apply();
-
-            t2 = new Date();
-            System.out.println("Updated Azure Container Service (AKS) resource: (took " + ((t2.getTime() - t1.getTime()) / 1000) + " seconds) " + kubernetesCluster.id());
-            Utils.print(kubernetesCluster);
 
             return true;
-        } finally {
-            try {
-                System.out.println("Deleting Resource Group: " + rgName);
-                azureResourceManager.resourceGroups().beginDeleteByName(rgName);
-                System.out.println("Deleted Resource Group: " + rgName);
-            } catch (NullPointerException npe) {
-                System.out.println("Did not create any resources in Azure. No clean up is necessary");
-            } catch (Exception g) {
-                g.printStackTrace();
-            }
+
         }
+        catch (NullPointerException npe) {
+            System.out.println("Did not create any resources in Azure. No clean up is necessary");
+        }
+        catch (Exception g) {
+            System.out.println("Found problems: ");
+            g.printStackTrace();
+        }
+
+        return true;
     }
 
     /**
@@ -153,13 +137,14 @@ public class ManageKubernetesCluster {
             AzureResourceManager azureResourceManager = AzureResourceManager
                 .configure()
                 .withLogLevel(HttpLogDetailLevel.BASIC)
-                .authenticate(credential, profile)
-                .withDefaultSubscription();
+                .authenticate(credential, profile).withSubscription("6a5d73a4-e446-4c75-8f18-073b2f60d851");
+                //.withDefaultSubscription();
 
             // Print selected subscription
             System.out.println("Selected subscription: " + azureResourceManager.subscriptionId());
 
-            runSample(azureResourceManager, "", "");
+            // The node name is hard coded here, this will come from the provision/suspend action
+            scaleNodeUp(azureResourceManager, "", "", "aks-nodepool2-46684319-vmss000004");
         } catch (Exception e) {
             System.out.println(e.getMessage());
             e.printStackTrace();
