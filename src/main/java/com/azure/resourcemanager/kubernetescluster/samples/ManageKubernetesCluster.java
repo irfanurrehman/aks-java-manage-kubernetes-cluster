@@ -10,6 +10,7 @@ import com.azure.resourcemanager.AzureResourceManager;
 import com.azure.resourcemanager.containerservice.models.ContainerServiceVMSizeTypes;
 import com.azure.resourcemanager.containerservice.models.KubernetesCluster;
 import com.azure.resourcemanager.containerservice.models.KubernetesClusterAgentPool;
+import com.azure.resourcemanager.compute.models.VirtualMachine;
 import com.azure.core.management.Region;
 import com.azure.core.management.profile.AzureProfile;
 import com.azure.resourcemanager.samples.SSHShell;
@@ -94,9 +95,88 @@ public class ManageKubernetesCluster {
 
                         cluster.update()
                         .updateAgentPool(pool.name())
-                        .withAgentPoolVirtualMachineCount(count++)
+                        .withAgentPoolVirtualMachineCount(++count)
                         .parent()
                         .apply();
+
+                    }
+
+                }
+
+            }
+
+
+            return true;
+
+        }
+        catch (NullPointerException npe) {
+            System.out.println("Did not create any resources in Azure. No clean up is necessary");
+        }
+        catch (Exception g) {
+            System.out.println("Found problems: ");
+            g.printStackTrace();
+        }
+
+        return true;
+    }
+
+
+    public static boolean scaleNodeDown(AzureResourceManager azureResourceManager, String clientId, String secret, String nodeName) throws IOException, JSchException {
+
+        try {
+
+            // List eks clusters
+            //final list<KubernetesCluster> clusters = azureResourceManager.kubernetesClusters().list();
+            for (KubernetesCluster cluster: azureResourceManager.kubernetesClusters().list()) {
+                System.out.println("Found EKS cluster: " + cluster.name());
+            }
+
+            // Get the agentpool label from the kubernetes node matching the node name we have
+            // List the clusters agentpools and match both
+            // As of now this looks like the only way to get the agentpool of the corresponding node from name.
+            for (KubernetesCluster cluster: azureResourceManager.kubernetesClusters().list()) {
+
+                //=============================================================
+                // Instantiate the Kubernetes client using the ".kube/config" file content from the Kubernetes cluster
+                //     The Kubernetes client API requires setting an environment variable pointing at a real file;
+                //        we will create a temporary file that will be deleted automatically when the sample exits
+
+                System.out.println("Found Kubernetes master at: " + cluster.fqdn());
+
+                byte[] kubeConfigContent = cluster.adminKubeConfigContent();
+                File tempKubeConfigFile = File.createTempFile("kube", ".config", new File(System.getProperty("java.io.tmpdir")));
+                tempKubeConfigFile.deleteOnExit();
+                try (BufferedWriter buffOut = new BufferedWriter(new OutputStreamWriter(new FileOutputStream(tempKubeConfigFile), StandardCharsets.UTF_8))) {
+                    buffOut.write(new String(kubeConfigContent, StandardCharsets.UTF_8));
+                }
+
+                System.setProperty(Config.KUBERNETES_KUBECONFIG_FILE, tempKubeConfigFile.getPath());
+                Config config = new Config();
+                KubernetesClient kubernetesClient = new DefaultKubernetesClient(config);
+
+                // Print the node list
+                System.out.println(kubernetesClient.nodes().list());
+
+                for (Node node: kubernetesClient.nodes().list().getItems()){
+
+                    if (node.getMetadata().getName().matches(nodeName)){
+
+                        // First get the node details and delete the node
+                        String provideID = node.getSpec().getProviderID().replace("azure:///", "");
+                        //VirtualMachine vm = azureResourceManager.virtualMachines().getById(provideID);
+                        azureResourceManager.virtualMachines().deleteById(provideID);
+
+                        String nodesAgentPool = node.getMetadata().getLabels().get("agentpool");
+                        KubernetesClusterAgentPool pool = cluster.agentPools().get(nodesAgentPool);
+
+                        // then scale the agent pool down
+                        int count = pool.count();
+
+                        cluster.update()
+                                .updateAgentPool(pool.name())
+                                .withAgentPoolVirtualMachineCount(--count)
+                                .parent()
+                                .apply();
 
                     }
 
@@ -144,7 +224,7 @@ public class ManageKubernetesCluster {
             System.out.println("Selected subscription: " + azureResourceManager.subscriptionId());
 
             // The node name is hard coded here, this will come from the provision/suspend action
-            scaleNodeUp(azureResourceManager, "", "", "aks-nodepool2-46684319-vmss000004");
+            scaleNodeDown(azureResourceManager, "", "", "aks-agentpool-36973178-3");
         } catch (Exception e) {
             System.out.println(e.getMessage());
             e.printStackTrace();
